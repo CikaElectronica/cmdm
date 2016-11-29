@@ -1,0 +1,249 @@
+Right now, given the expected application scenario, transparent mode seems more suitable to handle TCP,
+while the command mode is required to preserve message boundaries in UDP.
+There are a lot of possible applications calling this library, we will focus on those that have a behaviour
+similar to lwIP applications, so they can be ported here.
+The following is a free rant, rambling, on this very subject, that finally ends up on a conclusion
+(either right or wrong) on the path to follow on how to handle the data phase.
+Meanwhile... TCP will use transparent mode, and the first data handler will be for UDP.
+
+Send scenarios for UDP
+--------------
+
+1 The application has all the data in a buffer (beforehand) when calling the send function
+		a It fits within the module's buffering restrictions
+		b It does not fit within the module's buffering restrictions
+2 The application does not have all the data in a buffer (beforehand) when calling the send function
+	a Total lenght is known beforehand
+		a It fits within the module's buffering restrictions
+		b It does not fit within the module's buffering restrictions
+	b Total lenght is not known beforehand
+
+1.a: The application hands the data over by passing a buffer pointer and a data length
+1.b: The application must split the data in smaller chunks, and provide a way for these chunks
+     to be reassembled at destination. This belongs to the communications system design and
+     exceeds the provisions on this library.
+2.a.a: The application indicates the total data length, and sets up a callback function (datahandler)
+       which will be periodically called (until indicated data length is exhausted) to provide data
+       in a buffer
+2.a.b: same as 1.b
+2.b: The application sets up a callback function (datahandler), which will be periodically called
+     until it indicates its job is done, to provide data in a buffer. As the module relies on a
+     special character to indicate end of data, only non-binary (or at least data which is known to
+     not contain this special character) can be sent.
+
+1.a is supported right now
+1.b and 2.a.b are not supported
+2.a.a will be supported by a newer send function, not already implemented
+2.b will be supported by a newer send function, probably the same as 2.a.a ("length" field can tell
+    which operation mode is requested for the callback function), not already implemented
+
+    Yes, a solution for 2.a.a/2.b can also handle 1.a; but 1.a is easier/faster to write, easier to use,
+    consistent with the application in use at the moment of writing this library, and there is not much
+    time to spare at this very moment.
+
+TCP will just send what it has and don't care; since there are no message boundaries to preserve
+
+Receive scenarios
+-----------------
+
+1 The application can receive a whole message data in a buffer when calling the receive function
+	a UDP. Max data coming in depends on the other end sending, and so on the application
+	b TCP. Max data coming in depends on the module.
+2 The application can not hold the whole data in a buffer when calling the receive function
+	a same as 1.a
+	b same as 1.b
+
+1.a: The application gets its data filled in by passing a buffer pointer and a max data length (for safety).
+     If incoming data is larger than informed max length, it will be discarded. It might be finally
+     retrieved by several calls, as long as the module supports this; however, the application must
+     handle this data fragmentation itself, as this will break the message delimitation built into UDP.
+     Since the buffer size has been assigned as larger than the maximum UDP message size, passing more
+     data than expected is not a good practice and this should not occur on a well designed comm system.
+1.b: Same transfer mechanism as 1.a. However, the buffer should be sized larger than the maximum module
+     supported size, since it is not known in advance how much data will come.
+2.a: This is similar to 1.a. Here, the library fills in as many bytes as can be held, and the application
+     must call several times to get the whole data arriving in a single UDP datagram. This is supported
+     as long as the module supports it and the application can cope with this fragmentation for UDP
+     datagrams, losing original message limits.
+2.b: This fragmentation looks like a natural scenario for TCP.
+
+1.a is supported right now
+1.b and 2.a are not supported
+2.b will be suppported when we support TCP. The suggested scenario will be a temporary data holding buffer
+    in which to get incoming data and detect message limits, copying each assembled message to an application
+    buffer holding the entire message. This task will be performed by the protocol framing layer of the
+    application itself, this library will just extract from the module as many bytes as requested in each call,
+    copying them to the provided buffer. At birds-eye, this behavior looks almost the same as 1.a (because of
+    the safety length introduced)
+
+Half-duplex and finite time limitations
+---------------------------------------
+
+Messages can not be received while data is being pumped for transmission (send AT command)
+	The application can not reuse the buffer until data pump has finished.
+		This process has to be nonblocking, really ???
+			Well, AT+QISEND=123\r\n wait \r\nOK\r\n + 123 might take a while...
+				Assuming the module answers immediately, this is
+					20 * 11 * 1/115200 + (n * 11 * 1/115200 ) = 2ms + n * 100us
+				But the datasheets say the module can take upto 300ms...
+Messages can not be transmitted while received data is being downloaded (receive AT command)
+Data can not be sent (nor received, btw...) while the module is being asked if data is available
+
+The proposed scheme is the following:
+Always
+	The module's receive data is checked for unsolicited indication of incoming data
+The application is idle
+	At entering this state, and every time a preset timer expires
+		the module is queried for received data, in case somehow this indication got lost in the AT messaging
+If there is outstanding received data
+	UDP:
+		If the buffer is available
+			Data is extracted from the module. Any data exceeding the max length will be discarded (message truncated)
+			The receive callback will be called. The application will then free the buffer by calling a function
+		If the buffer is NOT available
+			Data is extracted from the module, and discarded, an error is indicated
+	TCP: probably the application might be able to extract as many bytes as it wants by issuing several calls to a receive function, as there are no message boundaries to preserve. This will be addressed later
+The application requests to send data by calling the send function and passing buffer address and data length, plus a "MOREDATA" flag
+	UDP: this data will be sent in a single UDP datagram
+	TCP: this data will be sent as the module sends TCP data
+The send function sends the data
+	When it has finished, if the "MOREDATA" flag was set
+		UDP: the sent callback will be called, so the application can resume sending more data
+		TCP: we need to check remote ACKs and make good use of module internal buffering, will be addressed later
+	Otherwise, the application is considered "idle"	
+
+If the application requests to send data while the module is busy:
+	sending data
+		this is an application error, it must honor the callback indication
+	receiving data
+		the send process will start after this process has finished, and the received data callback is called
+	asking if there is data
+		the send process will start after this process has finished.
+		if this process detects there is outstanding data, the received data callback will be called first
+	with previous send data waiting
+		this is an application error, it must honor the callback indication
+
+Unsolicited indications note: If the received URC is not the expected one, the processing function should pass the data to another system function to handle incoming calls and sms messages
+
+
+*** NOTE ***
+ Perhaps we should re-check for outstanding data after getting a datagram ?
+If more data comes during the time from the URC indication to the moment we end getting data
+out of the module, there won't be any indication and data will stay waiting until the safety
+timer expires and ASKRCV is triggered...
+Something similar might occur while we are sending. Here, probably entering IDLE with the timer=0
+would be enough, as this will force a proper transition to ASKRCV
+However, on receive, we can't put more data in the buffer until the application frees it, so we need
+to call the callback function and see what it does with the buffer or if it instructs us to collect
+more data (if available) from the modem
+
+<BEGINCHART>
+__Data States
+IDLE
+	// everytime we enter here, an idle timer is started
+	check module received data, if there is a string available, process it,
+	if it signals
+	incoming data	RECEIVE
+	// what error conditions can we get here ??? they surely mean connection or IP is down
+	error	ERROR
+	timer expired	ASKRCV
+	txpending	SEND
+	if it is an unknown URC, return CMDM_UNKRC
+ASKRCV
+	// skip this if buffer is not free ? (rxdatasz = 0)
+	// we need a way to mark there is data waiting, so we can get it as soon as the buffer is
+	// freed, instead of waiting for the safety timer to expire. We can also ask everytime the
+	// buffer gets freed...
+	ask if there is outstanding receive data: send AT+algo,0; with timeout
+	process response
+	// returns [(0 or data length) + OK] or [ERROR]
+	oustanding data	RECEIVE
+	// if there is not, go idle
+	no data	IDLE
+	// ERROR means there is no connection
+	error	ERROR
+	// no response
+	timeout	ERROR
+SEND
+	length=0	IDLE
+	start timer
+	send AT+<send data>=<send length>; with timeout
+	process response
+	// returns > or ERROR
+	prompt	SENDING
+	// ERROR means there is no connection
+	error	ERROR
+	// no response
+	timeout	ERROR
+SENDING
+	pump buffer data to the module
+	done	SENDEND
+SENDEND
+	process response; with timeout
+	// returns OK or FAIL or ERROR
+	OK: check the "MOREDATA" flag 
+	// if it is set, call the sent callback, the send function will be called and it will put us back to work
+	// however, if it fails to do so because of programmer incompetence, we elegantly go idle
+	OK, MOREDATA=1: call callback	IDLE
+	// if it is not
+	OK, MOREDATA=0	IDLE
+	// FAIL should not be returned for UDP. For TCP it means "buffer is full, waiting for remote ACK"
+	FAIL	IDLE
+	//  ERROR means there is no connection
+	error	ERROR	 	
+	// no response
+	timeout	ERROR
+RECEIVE
+	// this is to get the whole datagram, no matter what our buffer size is
+	send AT+<receive data>=1500; with timeout
+	process response
+	// returns [0 or data length + OK] or [OK] or [ERROR]
+		// (0 + OK) and OK shouldn't happen if we arrive here after actually checking for data.
+		// ERROR shouldn't happpen for the very same reason
+		// however, make a graceful exit if len is 0 (no len found)
+		// *** we won't be checking for data if we come from RECEIVEND
+	length=0	IDLE
+	// no response
+	timeout	ERROR
+	length>0	RECEIVING
+RECEIVING
+	// start a timer on entry
+	extract data from the module and copy to buffer
+	restart the timer everytime data is available
+	if the buffer is not available, or max length is reached and there is still data, keep extracting but discard it
+	// if data stops coming after some time, something awful happened, should reset the module, but wil let that to the application retries
+	data timeout	ERROR
+	done	RECEIVEND
+RECEIVEND
+	process response; with timeout
+	// should be an OK at the end of the data
+		// gracefully exit if there is not after some time
+	response timeout	ERROR
+	OK: call the callback function, passing rxdatasz as a parameter
+	// the callback will return the new rxdatasz, or 0 if it does not free the buffer
+	// rxdatasz = *datarecvdcback(rxdatasz)
+	// mods to the buffer address will require a call to setrecvdbfr, but the size can be handled here.
+	OK, buffer ready	RECEIVE
+	OK, buffer busy	IDLE
+ERROR
+	call error callback
+	return error	ERROR
+<ENDCHART>
+
+Functions:
+send: (errors returned, if any, are application errors, usage errors, not communications errors)
+	if there is previous data waiting, return error
+	if state is SEND or SENDING, return error
+	setup source buffer address and length; when state transitions to IDLE, data will start to be sent
+	copied address and length will be reset (len=0) when transmission has finished
+setsentcback
+	if not set, no indication of sent data will be available
+setrcvdcback
+	if not set, any received data will be discarded, an error indication can be obtained
+seterrcback
+	if not set, no error indications can be obtained
+setrx(address, len)
+	copies address and length to an internal holding, to copy received data there, when available
+	marks this very same space as free
+	it will be marked used when data arrives and it is copied
+
